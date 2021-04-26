@@ -70,7 +70,7 @@ class mlp_decoder(nn.Module):
         )
         
     def forward(self, z):
-        x_mu = self.decoder_mu(z).reshape(-1, *self.output_shape)
+        x_mu = self.decoder_mu(z).reshape(-1, self.output_shape)
         return x_mu
 
     

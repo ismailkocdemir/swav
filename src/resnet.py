@@ -366,18 +366,18 @@ class STN_Resnet_VAE(nn.Module):
             replace_stride_with_dilation=None,
             norm_layer=None,
             normalize=False,
+            eval_mode=False,
             small_image=True,
             input_shape=[3,96,96],
             stn_latent_size=64,
             resnet_output_size=1024,
             vae_latent_size=128,
-            with_decoder=False,
-            eval_mode=False
+            with_decoder=True,
+            penalize_view_similarity=True
     ):
         super(STN_Resnet_VAE, self).__init__()
         self.with_decoder = with_decoder
-        if self.with_decoder == True:
-            raise NotImplementedError("Decoder and reconstruction loss is not implemented yet. Please use it without the decoder.")
+        self.penalize_view_similarity = penalize_view_similarity
         self.stn = get_transformer('affine_RNN')(input_shape, stn_latent_size)
         self.resnet = ResNet(
             block,
@@ -398,13 +398,13 @@ class STN_Resnet_VAE(nn.Module):
         )
         self.stn_latent_size = stn_latent_size
         self.resnet_output_size = resnet_output_size
-        # concatenated input size : resnet output size + affine transformation size
-        self.vae_input_size = resnet_output_size + 6
+        self.vae_input_size = resnet_output_size
         self.vae = get_VAE('VanillaVAE_MLP')(self.vae_input_size, vae_latent_size, self.with_decoder)
         # When contrasing latent representations/reconstructions,
         # since the likelihood and prior is modelled with gaussian, 
         # we end up with MSE after omitting variance and other constants.
         self.contrastive_loss = nn.MSELoss()
+        self.view_similarity = nn.CosineSimilarity(dim=1)
 
     def forward(self, inputs):
         # first, extract views with RNN-STN randomly, except that the second conditioned on the first
@@ -418,13 +418,12 @@ class STN_Resnet_VAE(nn.Module):
             # extract features with resnet
             feats = self.resnet(view)
             # each feature-map is combined with affine transf. params of the other (theta list is reversed)
-            vae_input = torch.cat([feats, theta], dim=1)
-            vae_output = self.vae(vae_input)
+            vae_output = self.vae(feats, theta)
             outputs.append(vae_output)
-        return outputs
+        return outputs, thetas
     
 
-    def calculate_loss(self, outputs):
+    def calculate_loss(self, outputs, thetas):
         '''
             Combine the losses from VAE objective and Consrastive objective.
         '''
@@ -438,16 +437,28 @@ class STN_Resnet_VAE(nn.Module):
             else:
                 to_contrast.append(output['z'])
 
-            vae_loss = self.vae.loss_function(**output)
-            loss_vars['reconstruction_loss'] = vae_loss['reconstruction_loss']
-            loss_vars['KLD'] = vae_loss['KLD']
-            
-            # add total VAE loss (KLD and reconsturction) to total loss, for the current crop/view in the outputs. 
-            total_loss = total_loss + vae_loss['loss']
-            
-        loss_vars['contrastive_loss'] = self.contrastive_loss(to_contrast[0], to_contrast[1])
-        # add the constrastive loss (MSE) to the total loss.
-        total_loss = total_loss + loss_vars['contrastive_loss']
+            kld_loss = self.vae.loss_function(**output)
+            loss_vars['KLD'] = kld_loss
+            # add total VAE loss (KLD) to total loss, for the current crop/view in the outputs. 
+            total_loss += kld_loss
+        
+        if self.with_decoder:
+            recons_0_1 = self.contrastive_loss(to_contrast[0], outputs[1]['input'])
+            recons_1_0 = self.contrastive_loss(to_contrast[1], outputs[0]['input'])
+            loss_vars['contrastive_loss'] = (recons_0_1 + recons_1_0) * 0.5
+            total_loss += loss_vars['contrastive_loss']
+        else:
+            loss_vars['contrastive_loss'] = self.contrastive_loss(to_contrast[0], to_contrast[1])
+            # add the constrastive loss (MSE) to the total loss.
+            total_loss += loss_vars['contrastive_loss']
+
+        loss_vars['view_similarity_loss'] = 0.
+        if self.penalize_view_similarity:
+            view_sim = self.view_similarity(thetas[0], thetas[1])
+            zero_tensor = torch.FloatTensor([0]).to(thetas[0].device)
+            view_sim_loss = torch.max(zero_tensor, view_sim - 0.9).mean()
+            total_loss += view_sim_loss
+            loss_vars['view_similarity_loss'] = view_sim_loss
 
         return total_loss, loss_vars 
         

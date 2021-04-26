@@ -13,13 +13,17 @@ class VanillaVAE_MLP(nn.Module):
                  **kwargs) -> None:
         super(VanillaVAE_MLP, self).__init__()
 
+        self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.with_decoder = with_decoder
 
-        self.encoder = get_encoder('mlp')(input_dim, latent_dim)
         if self.with_decoder:
-            output_dim = input_dim
-            self.decoder = get_decoder('mlp')(output_dim, latent_dim)
+            output_dim  = input_dim
+            self.encoder = get_encoder('mlp')(input_dim, latent_dim)
+            self.decoder = get_decoder('mlp')(output_dim, latent_dim + 6)
+        else:
+            self.encoder = get_encoder('mlp')(input_dim + 6, latent_dim)
+
 
     def encode(self, input: Tensor) -> List[Tensor]:
         """
@@ -52,19 +56,25 @@ class VanillaVAE_MLP(nn.Module):
         eps = torch.randn_like(std)
         return eps * std + mu
 
-    def forward(self, input: Tensor, **kwargs) -> List[Tensor]:
-        mu, log_var = self.encode(input)
+    def forward(self, input: Tensor, theta: Tensor, **kwargs) -> List[Tensor]:
+        if self.with_decoder:
+            mu, log_var = self.encode(input)
+        else:
+            input_combined = torch.cat([input, theta], dim=1)
+            mu, log_var = self.encode(input_combined)
+        
         z = self.reparameterize(mu, log_var)
+        
+        output = {'mu':mu, 'log_var':log_var, 'z':z}
 
         if self.with_decoder:
-            return  {'recons':self.decode(z), 'input':input, 'z':None, 'mu':mu, 'log_var':log_var}
-        else:
-            return  {'recons':None,           'input':None,  'z': z,   'mu':mu, 'log_var':log_var}
+            z_combined = torch.cat([z, theta], dim=1)
+            output['recons'] = self.decode(z_combined)
+            output['input'] = input
+        
+        return output
 
     def loss_function(self,
-                    recons,
-                    input,
-                    z,
                     mu,
                     log_var,
                     *args,
@@ -77,14 +87,7 @@ class VanillaVAE_MLP(nn.Module):
         :return:
         """                                                                 
         kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
-
-        if self.with_decoder:
-            recons_loss = F.mse_loss(recons, input)
-        else:
-            recons_loss = 0.
-
-        loss = recons_loss + kld_loss
-        return {'loss': loss, 'reconstruction_loss':recons_loss, 'KLD':-kld_loss}
+        return kld_loss
 
     def sample(self,
                num_samples:int,

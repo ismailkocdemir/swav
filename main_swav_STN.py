@@ -11,6 +11,7 @@ import shutil
 import time
 from logging import getLogger
 
+
 import numpy as np
 import torchvision
 from torchvision import transforms
@@ -21,6 +22,7 @@ import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.optim
+from torch.utils.tensorboard import SummaryWriter
 #import apex
 #from apex.parallel.LARC import LARC
 
@@ -55,8 +57,10 @@ parser.add_argument("--stn_latent_size", default=64, type=int,
                     help="size of the latent dimension in the Spatial Transformer")
 parser.add_argument("--vae_latent_size", default=128, type=int,
                     help="size of the latent dimension in the VAE")
-parser.add_argument('--with_decoder', action='store_true', 
+parser.add_argument('--with_decoder', type=bool_flag, default=True, 
                     help='if set, contrastive loss is performed over reconstruction, otherwise on the latent space')
+parser.add_argument('--penalize_view_similarity', type=bool_flag, default=True, 
+                    help='if set, augmented views are penalizied if they are too similar')
 
 #########################
 #### optim parameters ###
@@ -68,7 +72,7 @@ parser.add_argument("--batch_size", default=32, type=int,
 parser.add_argument("--base_lr", default=0.1, type=float, help="base learning rate")
 parser.add_argument("--final_lr", type=float, default=0, help="final learning rate")
 parser.add_argument("--wd", default=1e-6, type=float, help="weight decay")
-parser.add_argument("--warmup_epochs", default=10, type=int, help="number of warmup epochs")
+parser.add_argument("--warmup_epochs", default=2, type=int, help="number of warmup epochs")
 parser.add_argument("--start_warmup", default=0, type=float,
                     help="initial warmup learning rate")
 
@@ -123,6 +127,7 @@ def main():
         resnet_output_size=args.resnet_output_size,
         vae_latent_size=args.vae_latent_size,
         with_decoder=args.with_decoder,
+        penalize_view_similarity=args.penalize_view_similarity
     )
     
     '''
@@ -183,14 +188,14 @@ def main():
     start_epoch = to_restore["epoch"]
 
     cudnn.benchmark = True
-
+    summary_writer = SummaryWriter(args.dump_path)
     for epoch in range(start_epoch, args.epochs):
 
         # train the network for one epoch
         logger.info("============ Starting epoch %i ... ============" % epoch)
 
 
-        scores= train(train_loader, model, optimizer, epoch, lr_schedule)
+        scores= train(train_loader, model, optimizer, epoch, lr_schedule, summary_writer)
         training_stats.update(scores)
 
         # save checkpoints
@@ -213,7 +218,7 @@ def main():
                 )
 
 
-def train(train_loader, model, optimizer, epoch, lr_schedule):
+def train(train_loader, model, optimizer, epoch, lr_schedule, summary_writer):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -231,8 +236,8 @@ def train(train_loader, model, optimizer, epoch, lr_schedule):
             param_group["lr"] = lr_schedule[iteration]
 
         # ============ multi-view forward passes ... ============
-        outputs = model(inputs.to(device))
-        loss, loss_vars = model.calculate_loss(outputs)
+        outputs, thetas = model(inputs.to(device))
+        loss, loss_vars = model.calculate_loss(outputs, thetas)
         
         # ============ backward and optim step ... ============
         optimizer.zero_grad()
@@ -248,6 +253,13 @@ def train(train_loader, model, optimizer, epoch, lr_schedule):
         batch_time.update(time.time() - end)
         end = time.time()
         if args.rank ==0 and it % 50 == 0:
+            # update the tensorboard
+            summary_writer.add_scalar('lr', lr_schedule[iteration], iteration)
+            for k,v in loss_vars.items():
+                summary_writer.add_scalar(k, v, iteration)
+            summary_writer.flush()
+
+            # update the logger
             logger.info(
                 "Epoch: [{0}][{1}]\t"
                 "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
