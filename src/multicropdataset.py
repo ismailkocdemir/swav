@@ -9,8 +9,10 @@ from logging import getLogger
 
 from PIL import ImageFilter
 import numpy as np
+import torch.nn as nn
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
+import kornia.augmentation as K
 
 logger = getLogger()
 
@@ -84,7 +86,6 @@ class PILRandomGaussianBlur(object):
             )
         )
 
-
 def get_color_distortion(s=1.0):
     # s is the strength of color distortion.
     color_jitter = transforms.ColorJitter(0.8*s, 0.8*s, 0.8*s, 0.2*s)
@@ -92,3 +93,35 @@ def get_color_distortion(s=1.0):
     rnd_gray = transforms.RandomGrayscale(p=0.2)
     color_distort = transforms.Compose([rnd_color_jitter, rnd_gray])
     return color_distort
+
+class KorniaAugmentationPipeline(nn.Module):
+   def __init__(self,
+                s_color=1.0, 
+                p_color=0.8, 
+                p_flip=0.5,
+                p_gray=0.2, 
+                p_blur=0.5, 
+                kernel_min=0.1, 
+                kernel_max=2.) -> None:
+      super(KorniaAugmentationPipeline, self).__init__()
+      
+      T_hflip = K.RandomHorizontalFlip(p=p_flip) 
+      T_color = K.ColorJitter(p_color, 0.8*s_color, 0.8*s_color, 0.8*s_color, 0.2*s_color, keepdim=True)
+      T_gray = K.RandomGrayscale(p=p_gray, keepdim=True)
+      
+      radius = kernel_max*2  # https://dsp.stackexchange.com/questions/10057/gaussian-blur-standard-deviation-radius-and-kernel-size
+      kernel_size = int(radius*2 + 1) # needs to be odd.
+      kernel_size = (kernel_size, kernel_size)
+
+      T_blur = K.GaussianBlur(kernel_size=kernel_size, sigma=(kernel_min, kernel_max), p=p_blur)
+      
+      self.transform = nn.Sequential(
+            T_hflip,
+            T_color,
+            T_gray,
+            T_blur
+      )
+
+   def forward(self, input):
+       return self.transform(input)
+      

@@ -7,6 +7,8 @@
 
 import torch
 import torch.nn as nn
+from .vanilla_vae import get_VAE
+from .spatial_transformer import get_transformer
 
 
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
@@ -147,12 +149,16 @@ class ResNet(nn.Module):
             hidden_mlp=0,
             nmb_prototypes=0,
             eval_mode=False,
+            multi_cropped_input=True,
+            small_image=False
     ):
         super(ResNet, self).__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
 
+        self.small_image = small_image
+        self.multi_cropped_input = multi_cropped_input
         self.eval_mode = eval_mode
         self.padding = nn.ConstantPad2d(1, 0.0)
 
@@ -172,12 +178,19 @@ class ResNet(nn.Module):
 
         # change padding 3 -> 2 compared to original torchvision code because added a padding layer
         num_out_filters = width_per_group * widen
-        self.conv1 = nn.Conv2d(
-            3, num_out_filters, kernel_size=7, stride=2, padding=2, bias=False
-        )
+        if self.small_image:
+            self.conv1 = nn.Conv2d(
+                3, num_out_filters, kernel_size=5, stride=1, padding=2, bias=False
+            )
+        else:
+            self.conv1 = nn.Conv2d(
+                3, num_out_filters, kernel_size=7, stride=2, padding=2, bias=False
+            )
         self.bn1 = norm_layer(num_out_filters)
         self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        if not self.small_image:
+            self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        
         self.layer1 = self._make_layer(block, num_out_filters, layers[0])
         num_out_filters *= 2
         self.layer2 = self._make_layer(
@@ -280,7 +293,8 @@ class ResNet(nn.Module):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
-        x = self.maxpool(x)
+        if not self.small_image:
+            x = self.maxpool(x)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
@@ -306,21 +320,24 @@ class ResNet(nn.Module):
         return x
 
     def forward(self, inputs):
-        if not isinstance(inputs, list):
-            inputs = [inputs]
-        idx_crops = torch.cumsum(torch.unique_consecutive(
-            torch.tensor([inp.shape[-1] for inp in inputs]),
-            return_counts=True,
-        )[1], 0)
-        start_idx = 0
-        for end_idx in idx_crops:
-            _out = self.forward_backbone(torch.cat(inputs[start_idx: end_idx]).cuda(non_blocking=True))
-            if start_idx == 0:
-                output = _out
-            else:
-                output = torch.cat((output, _out))
-            start_idx = end_idx
-        return self.forward_head(output)
+        if self.multi_cropped_input:
+            if not isinstance(inputs, list):
+                inputs = [inputs]
+            idx_crops = torch.cumsum(torch.unique_consecutive(
+                torch.tensor([inp.shape[-1] for inp in inputs]),
+                return_counts=True,
+            )[1], 0)
+            start_idx = 0
+            for end_idx in idx_crops:
+                _out = self.forward_backbone(torch.cat(inputs[start_idx: end_idx]).cuda(non_blocking=True))
+                if start_idx == 0:
+                    output = _out
+                else:
+                    output = torch.cat((output, _out))
+                start_idx = end_idx
+            return self.forward_head(output)
+        else:
+            return self.forward_head(self.forward_backbone(inputs))
 
 
 class MultiPrototypes(nn.Module):
@@ -337,17 +354,120 @@ class MultiPrototypes(nn.Module):
         return out
 
 
+class STN_Resnet_VAE(nn.Module):
+    def __init__(
+            self,
+            block,
+            layers,
+            zero_init_residual=False,
+            groups=1,
+            widen=1,
+            width_per_group=64,
+            replace_stride_with_dilation=None,
+            norm_layer=None,
+            normalize=False,
+            small_image=True,
+            input_shape=[3,96,96],
+            stn_latent_size=64,
+            resnet_output_size=1024,
+            vae_latent_size=128,
+            with_decoder=False,
+            eval_mode=False
+    ):
+        super(STN_Resnet_VAE, self).__init__()
+        self.with_decoder = with_decoder
+        if self.with_decoder == True:
+            raise NotImplementedError("Decoder and reconstruction loss is not implemented yet. Please use it without the decoder.")
+        self.stn = get_transformer('affine_RNN')(input_shape, stn_latent_size)
+        self.resnet = ResNet(
+            block,
+            layers,
+            zero_init_residual,
+            groups,
+            widen,
+            width_per_group,
+            replace_stride_with_dilation,
+            norm_layer,
+            normalize,
+            output_dim = resnet_output_size,
+            hidden_mlp=0,
+            nmb_prototypes=0,
+            eval_mode=False,
+            multi_cropped_input=False,
+            small_image=small_image
+        )
+        self.stn_latent_size = stn_latent_size
+        self.resnet_output_size = resnet_output_size
+        # concatenated input size : resnet output size + affine transformation size
+        self.vae_input_size = resnet_output_size + 6
+        self.vae = get_VAE('VanillaVAE_MLP')(self.vae_input_size, vae_latent_size, self.with_decoder)
+        # When contrasing latent representations/reconstructions,
+        # since the likelihood and prior is modelled with gaussian, 
+        # we end up with MSE after omitting variance and other constants.
+        self.contrastive_loss = nn.MSELoss()
+
+    def forward(self, inputs):
+        # first, extract views with RNN-STN randomly, except that the second conditioned on the first
+        # initial hidden state of the RNN-STN is sampled from normal dist.
+        h_0 = torch.normal(0, 1, (inputs.size(0), self.stn_latent_size)).to(inputs.device)
+        views, thetas = self.stn(inputs, h_0)
+        
+        outputs = []
+        # loop through the views. there should be two of them.
+        for (view, theta) in zip(views, thetas[::-1]):
+            # extract features with resnet
+            feats = self.resnet(view)
+            # each feature-map is combined with affine transf. params of the other (theta list is reversed)
+            vae_input = torch.cat([feats, theta], dim=1)
+            vae_output = self.vae(vae_input)
+            outputs.append(vae_output)
+        return outputs
+    
+
+    def calculate_loss(self, outputs):
+        '''
+            Combine the losses from VAE objective and Consrastive objective.
+        '''
+        total_loss = 0.
+        loss_vars = {}
+        to_contrast = []
+        # loop trough the views extracted with RNN-SPN. There should be two of them. 
+        for output in outputs:
+            if self.with_decoder:
+                to_contrast.append(output['recons'])
+            else:
+                to_contrast.append(output['z'])
+
+            vae_loss = self.vae.loss_function(**output)
+            loss_vars['reconstruction_loss'] = vae_loss['reconstruction_loss']
+            loss_vars['KLD'] = vae_loss['KLD']
+            
+            # add total VAE loss (KLD and reconsturction) to total loss, for the current crop/view in the outputs. 
+            total_loss = total_loss + vae_loss['loss']
+            
+        loss_vars['contrastive_loss'] = self.contrastive_loss(to_contrast[0], to_contrast[1])
+        # add the constrastive loss (MSE) to the total loss.
+        total_loss = total_loss + loss_vars['contrastive_loss']
+
+        return total_loss, loss_vars 
+        
+
+
 def resnet50(**kwargs):
     return ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
-
 
 def resnet50w2(**kwargs):
     return ResNet(Bottleneck, [3, 4, 6, 3], widen=2, **kwargs)
 
-
 def resnet50w4(**kwargs):
     return ResNet(Bottleneck, [3, 4, 6, 3], widen=4, **kwargs)
 
-
 def resnet50w5(**kwargs):
     return ResNet(Bottleneck, [3, 4, 6, 3], widen=5, **kwargs)
+
+def stn_resnet18_vae(**kwargs):
+    return STN_Resnet_VAE(BasicBlock, [2, 2, 2, 2], **kwargs)
+
+def stn_resnet34_vae(**kwargs):
+    return STN_Resnet_VAE(BasicBlock, [3, 4, 6, 3], **kwargs)
+
