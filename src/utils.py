@@ -172,6 +172,10 @@ def affine_decompose(A):
     return sx, sy, m, theta, tx, ty
 
 
+def calculate_new_shape(shape, factors=[1, 1/4, 1/4]):
+    assert len(shape) == len(factors), 'shape and factos shoud have the same dimensionality'
+    return [int(s*f) for s,f in zip(shape, factors)]
+
 def construct_affine(params):
     device = params.device
     n = params.shape[0]

@@ -9,7 +9,9 @@ class VanillaVAE_MLP(nn.Module):
     def __init__(self,
                  input_dim: int,
                  latent_dim: int,
-                 with_decoder: bool = False,
+                 encoder_type='mlp',
+                 decoder_type='conv',
+                 with_decoder: bool = True,
                  **kwargs) -> None:
         super(VanillaVAE_MLP, self).__init__()
 
@@ -19,10 +21,10 @@ class VanillaVAE_MLP(nn.Module):
 
         if self.with_decoder:
             output_dim  = input_dim
-            self.encoder = get_encoder('mlp')(input_dim, latent_dim)
-            self.decoder = get_decoder('mlp')(output_dim, latent_dim + 6)
+            self.encoder = get_encoder(encoder_type)(input_dim, latent_dim)
+            self.decoder = get_decoder(decoder_type)(output_dim, latent_dim + 6)
         else:
-            self.encoder = get_encoder('mlp')(input_dim + 6, latent_dim)
+            self.encoder = get_encoder(encoder_type)(input_dim + 6, latent_dim)
 
 
     def encode(self, input: Tensor) -> List[Tensor]:

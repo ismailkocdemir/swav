@@ -51,14 +51,12 @@ parser.add_argument("--data_path", type=str, default="/HDD/DATASETS/",
 #########################
 ## STN_VAE_swav specific params #
 #########################
-parser.add_argument("--resnet_output_size", default=1024, type=int,
-                    help="size of the resnet output after the projection head")
+parser.add_argument("--encoder_hidden_size", default=512, type=int,
+                    help="size of hidden layer in the encoder/projection head")
 parser.add_argument("--stn_latent_size", default=64, type=int,
                     help="size of the latent dimension in the Spatial Transformer")
 parser.add_argument("--vae_latent_size", default=128, type=int,
                     help="size of the latent dimension in the VAE")
-parser.add_argument('--with_decoder', type=bool_flag, default=True, 
-                    help='if set, contrastive loss is performed over reconstruction, otherwise on the latent space')
 parser.add_argument('--penalize_view_similarity', type=bool_flag, default=True, 
                     help='if set, augmented views are penalizied if they are too similar')
 
@@ -124,9 +122,8 @@ def main():
         small_image=True,
         input_shape=[3,96,96],
         stn_latent_size=args.stn_latent_size,
-        resnet_output_size=args.resnet_output_size,
+        encoder_hidden_size=args.encoder_hidden_size,
         vae_latent_size=args.vae_latent_size,
-        with_decoder=args.with_decoder,
         penalize_view_similarity=args.penalize_view_similarity
     )
     
@@ -236,8 +233,8 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, summary_writer):
             param_group["lr"] = lr_schedule[iteration]
 
         # ============ multi-view forward passes ... ============
-        outputs, thetas = model(inputs.to(device))
-        loss, loss_vars = model.calculate_loss(outputs, thetas)
+        outputs = model(inputs.to(device))
+        loss, loss_vars = model.calculate_loss(outputs)
         
         # ============ backward and optim step ... ============
         optimizer.zero_grad()
@@ -249,7 +246,7 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, summary_writer):
         optimizer.step()
 
         # ============ misc ... ============
-        losses.update(loss_vars['contrastive_loss'], inputs[0].size(0))
+        losses.update(loss_vars['reconstruction_loss'], inputs[0].size(0))
         batch_time.update(time.time() - end)
         end = time.time()
         if args.rank ==0 and it % 50 == 0:

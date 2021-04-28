@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 from .vanilla_vae import get_VAE
 from .spatial_transformer import get_transformer
+from .encoder_decoder import get_decoder
+from .utils import *
 
 
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
@@ -149,8 +151,10 @@ class ResNet(nn.Module):
             hidden_mlp=0,
             nmb_prototypes=0,
             eval_mode=False,
+            use_leaky_relu_for_projection=False,
             multi_cropped_input=True,
-            small_image=False
+            small_image=False,
+            double_head=False
     ):
         super(ResNet, self).__init__()
         if norm_layer is None:
@@ -160,6 +164,7 @@ class ResNet(nn.Module):
         self.small_image = small_image
         self.multi_cropped_input = multi_cropped_input
         self.eval_mode = eval_mode
+        self.double_head = double_head
         self.padding = nn.ConstantPad2d(1, 0.0)
 
         self.inplanes = width_per_group * widen
@@ -212,15 +217,26 @@ class ResNet(nn.Module):
         # projection head
         if output_dim == 0:
             self.projection_head = None
+            self.projection_head_2 = None
         elif hidden_mlp == 0:
             self.projection_head = nn.Linear(num_out_filters * block.expansion, output_dim)
+            if self.double_head:
+                self.projection_head_2 = nn.Linear(num_out_filters * block.expansion, output_dim)
         else:
             self.projection_head = nn.Sequential(
                 nn.Linear(num_out_filters * block.expansion, hidden_mlp),
                 nn.BatchNorm1d(hidden_mlp),
-                nn.ReLU(inplace=True),
+                nn.LeakyReLU() if use_leaky_relu_for_projection else nn.ReLU(inplace=True),
                 nn.Linear(hidden_mlp, output_dim),
             )
+            if self.double_head:
+                self.projection_head_2 = nn.Sequential(
+                    nn.Linear(num_out_filters * block.expansion, hidden_mlp),
+                    nn.BatchNorm1d(hidden_mlp),
+                    nn.LeakyReLU() if use_leaky_relu_for_projection else nn.ReLU(inplace=True),
+                    nn.Linear(hidden_mlp, output_dim),
+                )
+
 
         # prototype layer
         self.prototypes = None
@@ -318,6 +334,11 @@ class ResNet(nn.Module):
         if self.prototypes is not None:
             return x, self.prototypes(x)
         return x
+    
+    def forward_head_2(self, x):
+        if self.projection_head_2 is not None:
+            x = self.projection_head_2(x)
+        return x
 
     def forward(self, inputs):
         if self.multi_cropped_input:
@@ -337,7 +358,13 @@ class ResNet(nn.Module):
                 start_idx = end_idx
             return self.forward_head(output)
         else:
-            return self.forward_head(self.forward_backbone(inputs))
+            feats = self.forward_backbone(inputs)
+            h_1 = self.forward_head(feats)
+            
+            if self.double_head:
+                return h_1, self.forward_head_2(feats)
+            
+            return h_1
 
 
 class MultiPrototypes(nn.Module):
@@ -370,13 +397,11 @@ class STN_Resnet_VAE(nn.Module):
             small_image=True,
             input_shape=[3,96,96],
             stn_latent_size=64,
-            resnet_output_size=1024,
             vae_latent_size=128,
-            with_decoder=True,
+            encoder_hidden_size = 1024,
             penalize_view_similarity=True
     ):
         super(STN_Resnet_VAE, self).__init__()
-        self.with_decoder = with_decoder
         self.penalize_view_similarity = penalize_view_similarity
         self.stn = get_transformer('affine_RNN')(input_shape, stn_latent_size)
         self.resnet = ResNet(
@@ -389,22 +414,45 @@ class STN_Resnet_VAE(nn.Module):
             replace_stride_with_dilation,
             norm_layer,
             normalize,
-            output_dim = resnet_output_size,
-            hidden_mlp=0,
+            hidden_mlp=encoder_hidden_size,
+            output_dim=vae_latent_size,
             nmb_prototypes=0,
             eval_mode=False,
+            use_leaky_relu_for_projection=True,
             multi_cropped_input=False,
-            small_image=small_image
+            double_head=True
         )
         self.stn_latent_size = stn_latent_size
-        self.resnet_output_size = resnet_output_size
+        self.vae_latent_size = vae_latent_size
+        self.decoder_output_shape = calculate_new_shape(input_shape, [1,1/4,1/4])
+        self.decoder = get_decoder('conv')(self.decoder_output_shape, vae_latent_size + 6)
+        '''
         self.vae_input_size = resnet_output_size
-        self.vae = get_VAE('VanillaVAE_MLP')(self.vae_input_size, vae_latent_size, self.with_decoder)
+        self.vae = get_VAE('VanillaVAE_MLP')(
+                self.vae_input_size, 
+                vae_latent_size, 
+                encoder_type='mlp',
+                decoder_type='conv',
+                with_decoder=self.with_decoder
+        )
+        '''
         # When contrasing latent representations/reconstructions,
         # since the likelihood and prior is modelled with gaussian, 
         # we end up with MSE after omitting variance and other constants.
         self.contrastive_loss = nn.MSELoss()
         self.view_similarity = nn.CosineSimilarity(dim=1)
+
+    def reparameterize(self, mu, log_var):
+        """
+        Reparameterization trick to sample from N(mu, var) from
+        N(0,1).
+        :param mu: (Tensor) Mean of the latent Gaussian [B x D]
+        :param logvar: (Tensor) Standard deviation of the latent Gaussian [B x D]
+        :return: (Tensor) [B x D]
+        """
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return eps * std + mu
 
     def forward(self, inputs):
         # first, extract views with RNN-STN randomly, except that the second conditioned on the first
@@ -412,53 +460,60 @@ class STN_Resnet_VAE(nn.Module):
         h_0 = torch.normal(0, 1, (inputs.size(0), self.stn_latent_size)).to(inputs.device)
         views, thetas = self.stn(inputs, h_0)
         
-        outputs = []
+        mus = []
+        log_vars = []
+        recons = []
+        recons_target = []
         # loop through the views. there should be two of them.
         for (view, theta) in zip(views, thetas[::-1]):
             # extract features with resnet
-            feats = self.resnet(view)
+            mu, log_var = self.resnet(view)
+            mus.append(mu)
+            log_vars.append(log_var)
+            
             # each feature-map is combined with affine transf. params of the other (theta list is reversed)
-            vae_output = self.vae(feats, theta)
-            outputs.append(vae_output)
-        return outputs, thetas
-    
+            latent = self.reparameterize(mu, log_var)
+            conditioned_latent = torch.cat([latent, theta], dim=1)
+            recon = self.decoder(conditioned_latent)
+            recons.append(recon)
+            
+            # downsample the input for simplified recons. target
+            target = nn.functional.interpolate(view, scale_factor=1/4)
+            recons_target.append(target)
+        return {'recons':recons, 'mu':mus, 'log_var':log_vars, 'theta':thetas, 'input':recons_target[::-1]}
 
-    def calculate_loss(self, outputs, thetas):
+
+    def KLD(self, mu, log_var):
+        '''
+           Kulback-Leibler Divergence for calculating the divergence between latent vars and normal dist.
+        '''
+        return torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
+
+    def calculate_loss(self, outputs):
         '''
             Combine the losses from VAE objective and Consrastive objective.
         '''
         total_loss = 0.
         loss_vars = {}
-        to_contrast = []
         # loop trough the views extracted with RNN-SPN. There should be two of them. 
-        for output in outputs:
-            if self.with_decoder:
-                to_contrast.append(output['recons'])
-            else:
-                to_contrast.append(output['z'])
-
-            kld_loss = self.vae.loss_function(**output)
-            loss_vars['KLD'] = kld_loss
+        for idx, recon in enumerate(outputs['recons']):
+            # add reconstruction loss to total loss, for the current crop/view in the outputs. 
+            recons_loss = self.contrastive_loss(recon, outputs['input'][idx])
+            loss_vars['reconstruction_loss'] = recons_loss
+            
             # add total VAE loss (KLD) to total loss, for the current crop/view in the outputs. 
+            kld_loss = self.KLD(outputs['mu'][idx], outputs['log_var'][idx])
+            loss_vars['KLD_1'] = kld_loss            
             total_loss += kld_loss
-        
-        if self.with_decoder:
-            recons_0_1 = self.contrastive_loss(to_contrast[0], outputs[1]['input'])
-            recons_1_0 = self.contrastive_loss(to_contrast[1], outputs[0]['input'])
-            loss_vars['contrastive_loss'] = (recons_0_1 + recons_1_0) * 0.5
-            total_loss += loss_vars['contrastive_loss']
-        else:
-            loss_vars['contrastive_loss'] = self.contrastive_loss(to_contrast[0], to_contrast[1])
-            # add the constrastive loss (MSE) to the total loss.
-            total_loss += loss_vars['contrastive_loss']
 
         loss_vars['view_similarity_loss'] = 0.
         if self.penalize_view_similarity:
-            view_sim = self.view_similarity(thetas[0], thetas[1])
-            zero_tensor = torch.FloatTensor([0]).to(thetas[0].device)
+            # penalize too similar views (cosine(v1, v2) > 0.9)
+            view_sim = self.view_similarity(outputs['theta'][0], outputs['theta'][1])
+            zero_tensor = torch.FloatTensor([0]).to(outputs['theta'][0].device)
             view_sim_loss = torch.max(zero_tensor, view_sim - 0.9).mean()
-            total_loss += view_sim_loss
             loss_vars['view_similarity_loss'] = view_sim_loss
+            total_loss += view_sim_loss
 
         return total_loss, loss_vars 
         
