@@ -67,10 +67,10 @@ parser.add_argument("--epochs", default=100, type=int,
                     help="number of total epochs to run")
 parser.add_argument("--batch_size", default=32, type=int,
                     help="batch size per gpu, i.e. how many unique instances per gpu")
-parser.add_argument("--base_lr", default=0.1, type=float, help="base learning rate")
+parser.add_argument("--base_lr", default=0.01, type=float, help="base learning rate")
 parser.add_argument("--final_lr", type=float, default=0, help="final learning rate")
-parser.add_argument("--wd", default=1e-6, type=float, help="weight decay")
-parser.add_argument("--warmup_epochs", default=2, type=int, help="number of warmup epochs")
+parser.add_argument("--wd", default=1e-4, type=float, help="weight decay")
+parser.add_argument("--warmup_epochs", default=10, type=int, help="number of warmup epochs")
 parser.add_argument("--start_warmup", default=0, type=float,
                     help="initial warmup learning rate")
 
@@ -192,7 +192,7 @@ def main():
         logger.info("============ Starting epoch %i ... ============" % epoch)
 
 
-        scores= train(train_loader, model, optimizer, epoch, lr_schedule, summary_writer)
+        scores = train(train_loader, model, optimizer, epoch, lr_schedule, summary_writer)
         training_stats.update(scores)
 
         # save checkpoints

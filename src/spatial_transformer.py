@@ -78,7 +78,7 @@ class ST_Affine_RNN(nn.Module):
             output_size = torch.Size([x.shape[0], *self.input_shape])
             grid = F.affine_grid(theta, output_size)
             view = F.grid_sample(x, grid)
-            view, _ = self.transform(view)
+            #view = self.transform(view)
             views.append(view)
 
         return views, thetas
