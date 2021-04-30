@@ -1,3 +1,7 @@
-# Unsupervised Learning of Visual Features by Contrasting Cluster Assignments
+# Unsupervised Learning of Visual Features
 
-Adapted from SwAV (https://arxiv.org/abs/2006.09882)
+An attempt for self-supervised learning combining:
+
+* Spatial transformers (for learning to augment/crop)
+* Contrastive learning with VAEs (clustering problem in SwAV is cast as varitional inference) 
+
