@@ -40,7 +40,7 @@ class ST_Affine_RNN(nn.Module):
         out_h, out_w = self.input_shape[1] // 4 , self.input_shape[2] // 4 
         self.rnn_input_shape = self.conv_channels * out_h * out_w
         # Sequential model (Gated Recurrent Unit) for producing a sequence of views
-        self.RNN = nn.GRU(self.rnn_input_shape, self.hidden_shape)
+        self.RNN = nn.GRUCell(self.rnn_input_shape, self.hidden_shape)
         
         # Regressor for 3 x 2 affine matrix
         self.fc_theta = nn.Sequential(
@@ -61,24 +61,24 @@ class ST_Affine_RNN(nn.Module):
     def forward(self, x, h_0):
         # ==== extract features ==== #
         feats = self.conv(x)
-        feats = feats.view(-1, self.rnn_input_shape).unsqueeze(0)
+        feats = feats.view(-1, self.rnn_input_shape)
 
         # ==== produce <num_steps> many views ==== #
         views = []
         thetas = []
-        curr_h = h_0.unsqueeze(0)
+        curr_h = h_0
         for step in range(self.num_steps):
             # regress the affine matrix
-            _, curr_h = self.RNN(feats, curr_h)        
+            curr_h = self.RNN(feats, curr_h)        
             theta = self.fc_theta(curr_h.squeeze(0))
             thetas.append(theta)
 
             # produce the view
             theta = theta.view(-1, 2, 3)
             output_size = torch.Size([x.shape[0], *self.input_shape])
-            grid = F.affine_grid(theta, output_size)
-            view = F.grid_sample(x, grid)
-            #view = self.transform(view)
+            grid = F.affine_grid(theta, output_size, align_corners=False)
+            view = F.grid_sample(x, grid, align_corners=False)
+            view = self.transform(view)[0]
             views.append(view)
 
         return views, thetas

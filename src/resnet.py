@@ -12,6 +12,7 @@ from .spatial_transformer import get_transformer
 from .encoder_decoder import get_decoder
 from .utils import *
 
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
     """3x3 convolution with padding"""
@@ -442,6 +443,11 @@ class STN_Resnet_VAE(nn.Module):
         self.contrastive_loss = nn.MSELoss()
         self.view_similarity = nn.CosineSimilarity(dim=1)
 
+        self.visuals = {}
+
+    def get_current_visuals(self,):
+        return self.visuals
+
     def reparameterize(self, mu, log_var):
         """
         Reparameterization trick to sample from N(mu, var) from
@@ -457,9 +463,9 @@ class STN_Resnet_VAE(nn.Module):
     def forward(self, inputs):
         # first, extract views with RNN-STN randomly, except that the second conditioned on the first
         # initial hidden state of the RNN-STN is sampled from normal dist.
-        h_0 = torch.normal(0, 1, (inputs.size(0), self.stn_latent_size)).to(inputs.device)
+        h_0 = torch.normal(0, 1, (inputs.size(0), self.stn_latent_size)).to(device)
         views, thetas = self.stn(inputs, h_0)
-        
+
         mus = []
         log_vars = []
         recons = []
@@ -480,6 +486,12 @@ class STN_Resnet_VAE(nn.Module):
             # downsample the input for simplified recons. target
             target = nn.functional.interpolate(view, scale_factor=1/4)
             recons_target.append(target)
+        
+        # cache the first four of the inputs and extracted views for visualisation
+        self.visuals = {'img':inputs[:4].detach().cpu(), 
+                        'view_1':views[0][:4].detach().cpu(), 
+                        'view_2':views[1][:4].detach().cpu()
+                        }
         return {'recons':recons, 'mu':mus, 'log_var':log_vars, 'theta':thetas, 'input':recons_target[::-1]}
 
 
@@ -488,6 +500,7 @@ class STN_Resnet_VAE(nn.Module):
            Kulback-Leibler Divergence for calculating the divergence between latent vars and normal dist.
         '''
         return torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
+
 
     def calculate_loss(self, outputs):
         '''
@@ -500,11 +513,12 @@ class STN_Resnet_VAE(nn.Module):
             # add reconstruction loss to total loss, for the current crop/view in the outputs. 
             recons_loss = self.contrastive_loss(recon, outputs['input'][idx])
             loss_vars['reconstruction_loss'] = recons_loss
+            total_loss = total_loss + recons_loss
             
             # add total VAE loss (KLD) to total loss, for the current crop/view in the outputs. 
             kld_loss = self.KLD(outputs['mu'][idx], outputs['log_var'][idx])
-            loss_vars['KLD_1'] = kld_loss            
-            total_loss += kld_loss
+            loss_vars['KLD_' + str(idx)] = kld_loss            
+            total_loss = total_loss + kld_loss
 
         loss_vars['view_similarity_loss'] = 0.
         if self.penalize_view_similarity:
@@ -513,7 +527,7 @@ class STN_Resnet_VAE(nn.Module):
             zero_tensor = torch.FloatTensor([0]).to(outputs['theta'][0].device)
             view_sim_loss = torch.max(zero_tensor, view_sim - 0.9).mean()
             loss_vars['view_similarity_loss'] = view_sim_loss
-            total_loss += view_sim_loss
+            total_loss = total_loss + view_sim_loss
 
         return total_loss, loss_vars 
         

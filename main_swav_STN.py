@@ -254,6 +254,10 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, summary_writer):
             summary_writer.add_scalar('lr', lr_schedule[iteration], iteration)
             for k,v in loss_vars.items():
                 summary_writer.add_scalar(k, v, iteration)
+            visuals_dict = model.get_current_visuals()
+            for k,v in visuals_dict.items():
+                grid = torchvision.utils.make_grid(v)
+                summary_writer.add_image(k, grid, iteration)
             summary_writer.flush()
 
             # update the logger

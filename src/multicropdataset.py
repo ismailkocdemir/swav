@@ -13,7 +13,7 @@ import torch.nn as nn
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 import kornia.augmentation as K
-from kornia.filters import GaussianBlur2d as KorniaGaussianBlur
+#from kornia.filters import GaussianBlur2d as KorniaGaussianBlur
 
 logger = getLogger()
 
@@ -87,6 +87,7 @@ class PILRandomGaussianBlur(object):
             )
         )
 
+'''
 class KorniaRandomGaussianBlur(nn.Module):
     """
     Apply Gaussian Blur to the PIL image. Take the radius and probability of
@@ -106,7 +107,7 @@ class KorniaRandomGaussianBlur(nn.Module):
         if not do_it:
             return img
         return self.blur(img)
-
+'''
 
 def get_color_distortion(s=1.0):
     # s is the strength of color distortion.
@@ -117,35 +118,33 @@ def get_color_distortion(s=1.0):
     return color_distort
 
 class KorniaAugmentationPipeline(nn.Module):
-   def __init__(self,
-                s_color=1.0, 
+    def __init__(self,
+                s_color=0.5, 
                 p_color=0.8, 
                 p_flip=0.5,
                 p_gray=0.2, 
                 p_blur=0.5, 
                 kernel_min=0.1, 
                 kernel_max=2.) -> None:
-      super(KorniaAugmentationPipeline, self).__init__()
-      
-      #T_hflip = K.RandomHorizontalFlip(p=p_flip) 
-      #T_gray = K.RandomGrayscale(p=p_gray)
-      self.T_color = K.ColorJitter(p_color, 0.8*s_color, 0.8*s_color, 0.8*s_color, 0.2*s_color)
+        super(KorniaAugmentationPipeline, self).__init__()
+        
+        T_hflip = K.RandomHorizontalFlip(p=p_flip) 
+        T_gray = K.RandomGrayscale(p=p_gray)
+        T_color = K.ColorJitter(p_color, 0.8*s_color, 0.8*s_color, 0.8*s_color, 0.2*s_color)
 
-      #radius = kernel_max*2  # https://dsp.stackexchange.com/questions/10057/gaussian-blur-standard-deviation-radius-and-kernel-size
-      #kernel_size = int(radius*2 + 1) # needs to be odd.
-      #kernel_size = (kernel_size, kernel_size)
+        radius = kernel_max*2  # https://dsp.stackexchange.com/questions/10057/gaussian-blur-standard-deviation-radius-and-kernel-size
+        kernel_size = int(radius*2 + 1) # needs to be odd.
+        kernel_size = (kernel_size, kernel_size)
+        T_blur = K.GaussianBlur(kernel_size=kernel_size, sigma=(kernel_min, kernel_max), p=p_blur)
+        #T_blur = KorniaRandomGaussianBlur(kernel_size=kernel_size, sigma=(kernel_min, kernel_max), p=p_blur)
 
-      #self.T_blur = KorniaRandomGaussianBlur(kernel_size=kernel_size, sigma=(kernel_min, kernel_max), p=p_blur)
-      '''
-      self.transform = nn.Sequential(
+        self.transform = nn.Sequential(
             T_hflip,
             T_color,
             T_gray,
-      )
-      '''
+            T_blur
+        )
 
-   def forward(self, input):
-       #out = self.transform(input)
-       #return self.T_blur(out[0])
-       return self.T_color(input)[0]
-      
+    def forward(self, input):
+        out = self.transform(input)
+        return out
